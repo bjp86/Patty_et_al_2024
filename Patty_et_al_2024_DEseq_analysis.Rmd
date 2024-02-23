@@ -1,0 +1,268 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r}
+library("plyr")
+library(GenomicRanges)
+library(Rsamtools)
+library(gplots)
+library(stringr)
+library(Biostrings)
+library(ballgown)
+library(Rsubread)
+library(rtracklayer)
+library(dplyr)
+library(magrittr)
+library(reshape)
+library(tidyr)
+library(DESeq2)
+library(ggplot2)
+library(tidyverse)
+library(ggpubr)
+library(rstatix)
+options(scipen = 999)
+library("sva")
+```
+
+
+Load all annotation files
+```{r}
+Patty_et_al_noncoding_features <- read.delim("~/noncoding_features.bed", header = F, sep = "\t", quote = "")
+
+PC_genes_full_lengths <- read.delim("~/Gencode_Mousev23_PC_genes.bed", header = F, sep = "\t", quote = "")
+
+PC_promoters <- read.delim("~/Gencode_Mousev23_PC_genes_promoters.bed", header = F, sep = "\t", quote = "")
+
+```
+
+
+TT-seq data count correction with combat-seq
+```{r}
+rawCounts <- read.delim("~/TTseq_counts_raw_counts.txt", header = T, sep = "\t", quote = "")
+
+rawCounts <- as.matrix(rawCounts)
+
+conditions <- read.delim("~/TTseq_combatseq_table.txt", header = T, sep = "\t", quote = "")
+
+covar_mod <- data.frame(conditions$Covariate)
+adjusted_counts <- ComBat_seq(rawCounts, covar_mod = covar_mod, batch = conditions$Batch)
+
+adjusted_counts_df_all <- as.data.frame(adjusted_counts)
+
+write.table(adjusted_counts_df_all,file=("~/TTseq_raw_counts_batchcorrected.txt"),quote=FALSE,sep="\t",row.names=T)
+```
+
+
+TT-seq 
+DEseq analysis
+This loops through all 29 KD conditions for TT-seq and generates several files for downstream analyses
+```{r}
+adjusted_counts_df <- read.delim("~/TTseq_raw_counts_batchcorrected.txt", header = T, sep = "\t", quote = "")
+
+#DEseq analysis
+target <- c("Chd2","Smarca4","Smarca5","Ino80","Chd4","Chd3","SRCAP","Atrx","Hells","Chd1_","Btaf1","Chd7","Chd8","Chd9","Chd1l","Chd5","Ercc6_","Ercc6l","Hltf","Rad54b","Rad54l_","Rad54l2","Shrph","SmarcaD","SmarcaL","Ttf2","Zranb3","Ep400","Smarca2")
+for (i in 1:length(target)) {
+i=2
+print(target[i])
+name <- target[i]
+#extract all Control replicates
+countData <- adjusted_counts_df %>% dplyr::select(contains("Control"))
+conditions <- rep("untreated", ncol(countData))
+conditions <- c(conditions, "treated","treated")
+conditions <- data.frame("condition"=conditions)
+#Extract all KD replicates 
+countData_sample <- adjusted_counts_df %>% dplyr::select(contains(target[i]))
+
+#combine all samples into 1 data frame
+countData <- cbind(countData,countData_sample)
+countData <- mutate_all(countData, function(x) as.integer(as.character(x)))
+countData[is.na(countData)] <- 0
+
+
+#DEseq analysis
+dds <- DESeqDataSetFromMatrix(countData = countData,
+                              colData = conditions,
+                              design = ~ condition)
+
+rownames(dds) <- rownames(adjusted_counts_df)
+
+#remove any features that do not have at least 10 counts in 50% of all Control and KD replicates
+keep <- rowSums( counts(dds) > 0 ) >= 0.5*ncol(countData)
+dds <- dds[keep,]
+keep <- rowSums( counts(dds) >= 10 ) >= 0.5*ncol(countData)
+dds <- dds[keep,]
+
+#this specifies the untreated as the reference point
+dds$condition <- relevel(dds$condition, ref = "untreated")
+
+dds <- DESeq(dds)
+res <- results(dds)
+resLFC <- lfcShrink(dds, coef="condition_treated_vs_untreated", type="apeglm")
+resLFCOrdered <- resLFC[order(resLFC$pvalue),]
+
+
+#generate and save normalized counts
+name <- str_replace(target[i], "_","")
+norm_counts <- as.data.frame(counts(dds, normalized=TRUE))
+write.table(norm_counts,file=(paste0("~/TTseq_DEseq_res/",name,"_norm_counts.txt")),quote=FALSE,sep="\t",row.names=TRUE)
+
+resSig <- subset(resLFC, padj < 0.05)
+x=as.data.frame(resSig)
+y <- rownames(x)
+x <- cbind(x,y)
+
+#extract uaRNAs  and saves DEseq2 results and beds
+df_uaRNAs <- x %>%
+  filter(grepl("_AS", x[,6])&abs(log2FoldChange)>=0.5)
+
+write.table(df_uaRNAs,file=(paste0("~/TTseq_DEseq_res/",name,"_uaRNAs.txt")),quote=FALSE,sep="\t",row.names=T,col.names = T)
+
+up_uaRNAs <- df_uaRNAs[df_uaRNAs$log2FoldChange>=0.5,]
+up_uaRNAs <- Patty_et_al_noncoding_features[(Patty_et_al_noncoding_features$V4 %in% up_uaRNAs$y),]
+write.table(up_uaRNAs,file=(paste0("~/TTseq_DEseq_res/",name,"_uaRNAs_up.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+
+down_uaRNAs <- df_uaRNAs[df_uaRNAs$log2FoldChange<=-0.5,]
+down_uaRNAs <- Patty_et_al_noncoding_features[(Patty_et_al_noncoding_features$V4 %in% down_uaRNAs$y),]
+write.table(down_uaRNAs,file=(paste0("~/TTseq_DEseq_res/",name,"_uaRNAs_down.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+#extract DHSs/putative enhancers  and saves DEseq2 results and beds
+df_DHS <- x %>%
+  filter(grepl("DHS", x[,6])&abs(log2FoldChange)>=0.5)
+
+write.table(df_DHS,file=(paste0("~/TTseq_DEseq_res/",name,"_DHSs.txt")),quote=FALSE,sep="\t",row.names=T,col.names = T)
+
+up_DHSs <- df_DHS[df_DHS$log2FoldChange>=0.5,]
+up_DHSs <- Patty_et_al_noncoding_features[(Patty_et_al_noncoding_features$V4 %in% up_DHSs$y),]
+write.table(up_DHSs,file=(paste0("~/TTseq_DEseq_res/",name,"_DHSs_up.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+
+down_DHSs <- df_DHS[df_DHS$log2FoldChange<=-0.5,]
+down_DHSs <- Patty_et_al_noncoding_features[(Patty_et_al_noncoding_features$V4 %in% down_DHSs$y),]
+write.table(down_DHSs,file=(paste0("~/TTseq_DEseq_res/",name,"_DHSs_down.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+
+#extract mRNAs and saves DEseq2 results and beds
+df_mRNAs <- x %>%
+  filter(!grepl("_", x[,6])&abs(log2FoldChange)>=0.75)
+
+
+write.table(zz_mRNAs,file=(paste0("~/TTseq_DEseq_res/",name,"_mRNAs_<0.05.txt")),quote=FALSE,sep="\t",row.names=T,col.names = T)
+
+up_mRNAs <- df_mRNAs[df_mRNAs$log2FoldChange>=0.75,]
+up_mRNAs <- PC_genes_full_lengths[(PC_genes_full_lengths$V4 %in% up_mRNAs$y),]
+write.table(up_mRNAs,file=(paste0("~/TTseq_DEseq_res/",name,"_mRNAs_up.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+
+down_mRNAs <- df_mRNAs[df_mRNAs$log2FoldChange<=-0.75,]
+down_mRNAs <- PC_genes_full_lengths[(PC_genes_full_lengths$V4 %in% down_mRNAs$y),]
+write.table(down_mRNAs,file=(paste0("~/TTseq_DEseq_res/",name,"_mRNAs_down.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+
+up_promoters <- df_mRNAs[df_mRNAs$log2FoldChange>=0.75,]
+up_promoters <- PC_promoters[(PC_promoters$V4 %in% up_promoters$y),]
+write.table(up_promoters,file=(paste0("~/TTseq_DEseq_res/",name,"_promoters_up.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+
+down_promoters <- df_mRNAs[df_mRNAs$log2FoldChange<=-0.75,]
+down_promoters <- PC_promoters[(PC_promoters$V4 %in% down_promoters$y),]
+write.table(down_promoters,file=(paste0("~/TTseq_DEseq_res/",name,"_promoters_down.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+}
+```
+
+
+
+For RNA-seq counts adjustment with combatseq
+```{r}
+rawCounts <- read.delim("~/RNAseq_raw_counts.txt", header = T, sep = "\t", quote = "")
+
+rawCounts <- as.matrix(rawCounts)
+
+conditions <- read.delim("~/RNAseq_combatseq_table.txt", header = T, sep = "\t", quote = "")
+
+covar_mod <- data.frame(conditions$Covariate)
+adjusted_counts <- ComBat_seq(rawCounts, covar_mod = covar_mod, batch = conditions$Batch)
+
+adjusted_counts_df <- as.data.frame(adjusted_counts)
+
+adjusted_counts_df_all <- as.data.frame(adjusted_counts)
+
+write.table(adjusted_counts_df_all,file=("~/RNAseq_raw_counts_batchcorrected.txt"),quote=FALSE,sep="\t",row.names=T)
+```
+
+
+RNA-seq DEseq analysis
+```{r}
+adjusted_counts_df <- read.delim("~/RNAseq_raw_counts_batchcorrected.txt", header = T, sep = "\t", quote = "")
+
+
+target <- c("Chd2","Smarca4","Smarca5","Ino80","Chd4","Chd3","SRCAP","Atrx","Hells","Chd1_","Btaf1","Chd7","Chd8","Chd9","Chd1l","Chd5","Ercc6_","Ercc6l","Hltf","Rad54b","Rad54l_","Rad54l2","Shrph","SmarcaD","SmarcaL","Ttf2","Zranb3","Ep400","Smarca2")
+
+for (i in 1:length(target)) {
+#i=1
+print(target[i])
+name <- target[i]
+#extract all Control replicates
+countData <- adjusted_counts_df %>% dplyr::select(contains("Control"))
+conditions <- rep("untreated", ncol(countData))
+conditions <- c(conditions, "treated","treated")
+conditions <- data.frame("condition"=conditions)
+#Extract all KD replicates 
+countData_sample <- adjusted_counts_df %>% dplyr::select(contains(target[i]))
+countData_sample <- countData_sample[,1:2]
+
+#combine
+countData <- cbind(countData,countData_sample)
+countData <- mutate_all(countData, function(x) as.integer(as.character(x)))
+countData[is.na(countData)] <- 0
+
+
+#start of DEseq2 analysis
+dds <- DESeqDataSetFromMatrix(countData = countData,
+                              colData = conditions,
+                              design = ~ condition)
+
+
+rownames(dds) <- rownames(adjusted_counts_df)
+keep <- rowSums( counts(dds) > 0 ) >= 0.5*ncol(countData)
+dds <- dds[keep,]
+keep <- rowSums( counts(dds) >= 10 ) >= 0.5*ncol(countData)
+dds <- dds[keep,]
+
+#this specifies the untreated as the reference point!
+dds$condition <- relevel(dds$condition, ref = "untreated")
+
+dds <- DESeq(dds)
+res <- results(dds)
+resLFC <- lfcShrink(dds, coef="condition_treated_vs_untreated", type="apeglm")
+resLFCOrdered <- resLFC[order(resLFC$pvalue),]
+
+#summary(resLFC)
+#plotMA(resLFC, ylim=c(-4,4))
+
+#Filter only for genes padj <=0.05 and abs(LFC)>=0.75
+resSig <- subset(resLFC, padj <= 0.05)
+resSig <- subset(resSig, abs(log2FoldChange) >= 0.75)
+resSig
+
+#generate and save normalized counts
+name <- str_replace(target[i], "_","")
+norm_counts <- as.data.frame(counts(dds, normalized=TRUE))
+write.table(norm_counts,file=(paste0("~/RNAseq_DEseq_res/",name,"_norm_counts.txt")),quote=FALSE,sep="\t",row.names=TRUE)
+
+resSig <- subset(resLFC, padj < 0.05)
+x=as.data.frame(resSig)
+y <- rownames(x)
+x <- cbind(x,y)
+
+#extract mRNAs and saves DEseq2 results and beds
+df_mRNAs <- x %>%
+  filter(!grepl("_", x[,6])&abs(log2FoldChange)>=0.75)
+
+write.table(zz_mRNAs,file=(paste0("~/RNAseq_DEseq_res/",name,"_mRNAs_<0.05.txt")),quote=FALSE,sep="\t",row.names=T,col.names = T)
+
+up_mRNAs <- df_mRNAs[df_mRNAs$log2FoldChange>=0.75,]
+up_mRNAs <- PC_genes_full_lengths[(PC_genes_full_lengths$V4 %in% up_mRNAs$y),]
+write.table(up_mRNAs,file=(paste0("~/RNAseq_DEseq_res/",name,"_mRNAs_up.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+
+down_mRNAs <- df_mRNAs[df_mRNAs$log2FoldChange<=-0.75,]
+down_mRNAs <- PC_genes_full_lengths[(PC_genes_full_lengths$V4 %in% down_mRNAs$y),]
+write.table(down_mRNAs,file=(paste0("~/RNAseq_DEseq_res/",name,"_mRNAs_down.bed")),quote=FALSE,sep="\t",row.names=F,col.names = F)
+}
+```
+
