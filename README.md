@@ -1,1 +1,1 @@
-This directory contains code and files (included files) necessary to recapitulate batch correction by Combat-seq and differiential expression analysis with DEseq for TT-seq and RNA-seq data, the enhancer promoter pair permutation testing, and CUT&RUN analysis in our manuscript.
+This repository contains code and files (included files) necessary to recapitulate batch correction by Combat-seq and differiential expression analysis with DEseq for TT-seq and RNA-seq data, the enhancer promoter pair permutation testing, and CUT&RUN analysis in our manuscript.
